@@ -1,0 +1,101 @@
+# Push a main/master → construye la imagen Docker del API FastAPI, la sube a GHCR y despliega en EC2 por SSH.
+#
+# GitHub solo ejecuta workflows bajo .github/workflows en la RAÍZ del repositorio.
+# Si subes solo la carpeta backend como repo, esta ruta es correcta.
+# Si todo vive en un monorepo, copia este YAML a .github/workflows/ y pon en build-push: context: backend
+#
+# Secretos en GitHub → Settings → Secrets and variables → Actions:
+#   EC2_HOST              IP o DNS pública de la instancia
+#   EC2_USER              ej. ubuntu, ec2-user
+#   EC2_SSH_KEY           clave privada PEM
+#   BACKEND_DATABASE_URL  DATABASE_URL completa (PostgreSQL en RDS, EC2, etc.)
+#   N8N_WEBHOOK_URL       (opcional) URL del webhook de n8n para notificaciones al crear ventas
+#   CR_PAT                (opcional) PAT con read:packages si la imagen GHCR es privada
+#
+# En EC2: Docker instalado y el usuario en el grupo docker.
+
+name: Deploy backend to EC2
+
+on:
+  push:
+    branches: [main, master]
+
+env:
+  REGISTRY: ghcr.io
+  PACKAGE_NAME: sale-snap-backend
+
+jobs:
+  build-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Image name (GHCR)
+        id: meta
+        run: |
+          OWNER=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')
+          echo "owner=$OWNER" >> "$GITHUB_OUTPUT"
+          echo "image=${{ env.REGISTRY }}/${OWNER}/${{ env.PACKAGE_NAME }}" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.image }}:latest
+            ${{ steps.meta.outputs.image }}:${{ github.sha }}
+
+  deploy:
+    needs: build-push
+    runs-on: ubuntu-latest
+    steps:
+      - name: Image name
+        id: meta
+        run: |
+          OWNER=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')
+          echo "owner=$OWNER" >> "$GITHUB_OUTPUT"
+          echo "image=${{ env.REGISTRY }}/${OWNER}/${{ env.PACKAGE_NAME }}" >> "$GITHUB_OUTPUT"
+
+      - name: SSH deploy
+        uses: appleboy/ssh-action@v1.2.0
+        env:
+          REGISTRY: ${{ env.REGISTRY }}
+          IMAGE: ${{ steps.meta.outputs.image }}:latest
+          CR_PAT: ${{ secrets.CR_PAT }}
+          DATABASE_URL: ${{ secrets.BACKEND_DATABASE_URL }}
+          N8N_WEBHOOK_URL: ${{ secrets.N8N_WEBHOOK_URL }}
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          envs: REGISTRY,IMAGE,CR_PAT,DATABASE_URL,N8N_WEBHOOK_URL
+          script: |
+            set -e
+            if [ -z "$DATABASE_URL" ]; then
+              echo "DATABASE_URL no está definida en los secretos (BACKEND_DATABASE_URL)"
+              exit 1
+            fi
+            if [ -n "$CR_PAT" ]; then
+              echo "$CR_PAT" | docker login "$REGISTRY" -u "${{ github.actor }}" --password-stdin
+            fi
+            docker pull "$IMAGE"
+            docker stop sale-snap-backend 2>/dev/null || true
+            docker rm sale-snap-backend 2>/dev/null || true
+            docker run -d \
+              --name sale-snap-backend \
+              --restart unless-stopped \
+              -p 8000:8000 \
+              -e DATABASE_URL="$DATABASE_URL" \
+              -e N8N_WEBHOOK_URL="$N8N_WEBHOOK_URL" \
+              "$IMAGE"
